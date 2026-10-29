@@ -1,0 +1,108 @@
+rules_version = '2';
+service cloud.firestore {
+ match /databases/{database}/documents {
+  function signedIn() { return request.auth != null; }
+  function isAdmin() {
+   return signedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+    && get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.enabled == true;
+  }
+  function counterPath(day) { return /databases/$(database)/documents/counters/$(day); }
+  function ticketPath(id) { return /databases/$(database)/documents/tickets/$(id); }
+  function employeePath(code) { return /databases/$(database)/documents/employees/$(code); }
+
+  match /admins/{id} {
+   allow get: if signedIn() && request.auth.uid == id;
+   allow list, write: if false;
+  }
+  match /counters/{day} {
+   allow get: if signedIn();
+   allow list: if false;
+   allow create: if signedIn() && request.resource.data.keys().hasAll(['value','ticketId'])
+    && request.resource.data.keys().hasOnly(['value','ticketId'])
+    && request.resource.data.value == 1
+    && request.resource.data.ticketId is string
+    && getAfter(ticketPath(request.resource.data.ticketId)).data.sequence == 1
+    && getAfter(ticketPath(request.resource.data.ticketId)).data.day == day;
+   allow update: if signedIn() && request.resource.data.keys().hasAll(['value','ticketId'])
+    && request.resource.data.keys().hasOnly(['value','ticketId'])
+    && request.resource.data.value == resource.data.value + 1
+    && request.resource.data.ticketId is string
+    && getAfter(ticketPath(request.resource.data.ticketId)).data.sequence == request.resource.data.value
+    && getAfter(ticketPath(request.resource.data.ticketId)).data.day == day;
+   allow delete: if false;
+  }
+  match /tickets/{id} {
+   // Only queue number and service are public. Personal details live separately.
+   allow read: if true;
+   allow create: if signedIn() && request.resource.data.keys().hasAll(['id','number','sequence','day','service','status','createdAt'])
+    && request.resource.data.keys().hasOnly(['id','number','sequence','day','service','status','createdAt'])
+    && request.resource.data.id == id
+    && request.resource.data.day is string && request.resource.data.day.matches('[0-9]{4}-[0-9]{2}-[0-9]{2}')
+    && request.resource.data.number is string && request.resource.data.number.matches('A[0-9]{3,}')
+    && id == request.resource.data.day + '_' + request.resource.data.number
+    && request.resource.data.sequence is int && request.resource.data.sequence >= 1
+    && (request.resource.data.service == 'Banner Printing'
+      || request.resource.data.service == 'DTF / T-Shirt'
+      || request.resource.data.service == 'Stickers'
+      || request.resource.data.service == 'Graphic Design'
+      || request.resource.data.service == 'Huduma nyingine')
+    && request.resource.data.status == 'waiting' && request.resource.data.createdAt is string
+    && getAfter(counterPath(request.resource.data.day)).data.value == request.resource.data.sequence
+    && getAfter(counterPath(request.resource.data.day)).data.ticketId == id
+    && (!exists(counterPath(request.resource.data.day)) && request.resource.data.sequence == 1
+      || exists(counterPath(request.resource.data.day))
+       && get(counterPath(request.resource.data.day)).data.value == request.resource.data.sequence - 1);
+   allow update: if isAdmin() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status','updatedAt'])
+    && (request.resource.data.status == 'waiting'
+      || request.resource.data.status == 'serving'
+      || request.resource.data.status == 'done')
+    && request.resource.data.updatedAt is string;
+   allow delete: if false;
+  }
+  match /ticketDetails/{id} {
+   allow get: if isAdmin() || signedIn() && resource.data.uid == request.auth.uid;
+   allow list: if false;
+   allow create: if signedIn() && request.resource.data.keys().hasAll(['uid','name','phone','details'])
+    && request.resource.data.keys().hasOnly(['uid','name','phone','details'])
+    && request.resource.data.uid == request.auth.uid
+    && request.resource.data.name is string && request.resource.data.name.size() <= 80
+    && request.resource.data.phone is string && request.resource.data.phone.size() <= 20
+    && request.resource.data.details is string && request.resource.data.details.size() <= 300
+    && getAfter(ticketPath(id)).data.id == id;
+   allow update, delete: if false;
+  }
+  match /employees/{code} {
+   // The unguessable QR code is the employee's bearer credential.
+   allow get: if signedIn() && code.matches('[A-HJ-NP-Z2-9]{16}');
+   allow list: if isAdmin();
+   allow create: if isAdmin() && code.matches('[A-HJ-NP-Z2-9]{16}')
+    && request.resource.data.keys().hasAll(['name','active','createdAt'])
+    && request.resource.data.keys().hasOnly(['name','active','createdAt'])
+    && request.resource.data.name is string && request.resource.data.name.size() > 0
+    && request.resource.data.name.size() <= 80 && request.resource.data.active == true
+    && request.resource.data.createdAt == request.time;
+   allow update, delete: if false;
+  }
+  match /attendance/{id} {
+   function validCode() {
+    return signedIn() && request.resource.data.code is string
+     && request.resource.data.code.matches('[A-HJ-NP-Z2-9]{16}')
+     && id == request.resource.data.day + '_' + request.resource.data.code
+     && exists(employeePath(request.resource.data.code))
+     && get(employeePath(request.resource.data.code)).data.active == true;
+   }
+   allow get: if isAdmin() || signedIn() && id.matches('[0-9]{4}-[0-9]{2}-[0-9]{2}_[A-HJ-NP-Z2-9]{16}');
+   allow list: if isAdmin();
+   allow create: if validCode()
+    && request.resource.data.keys().hasAll(['code','name','day','arrivedAt'])
+    && request.resource.data.keys().hasOnly(['code','name','day','arrivedAt'])
+    && request.resource.data.day is string && request.resource.data.day.matches('[0-9]{4}-[0-9]{2}-[0-9]{2}')
+    && request.resource.data.name == get(employeePath(request.resource.data.code)).data.name
+    && request.resource.data.arrivedAt == request.time;
+   allow update: if validCode() && !resource.data.keys().hasAny(['leftAt'])
+    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['leftAt'])
+    && request.resource.data.leftAt == request.time;
+   allow delete: if false;
+  }
+ }
+}
